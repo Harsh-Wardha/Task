@@ -1,0 +1,252 @@
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import pino from 'pino';
+import pinoHttp from 'pino-http';
+import { trace, context } from '@opentelemetry/api';
+import { GatewayService } from './services/gateway-service';
+import { CircuitBreakerService } from './services/circuit-breaker-service';
+
+// Initialize OpenTelemetry
+import './tracing';
+
+const logger = pino({
+  level: process.env['LOG_LEVEL'] || 'info',
+  formatters: {
+    level: (label) => ({ level: label }),
+  },
+});
+
+const app = express();
+const PORT = process.env['PORT'] || 3002;
+
+// Initialize services
+const circuitBreakerService = new CircuitBreakerService();
+const gatewayService = new GatewayService(circuitBreakerService, logger);
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+// Request logging middleware
+app.use(pinoHttp({
+  logger,
+  genReqId: () => crypto.randomUUID(),
+  customLogLevel: (_req, res, err) => {
+    if (res.statusCode >= 400 && res.statusCode < 500) {
+      return 'warn';
+    } else if (res.statusCode >= 500 || err) {
+      return 'error';
+    }
+    return 'info';
+  },
+  customSuccessMessage: (req, res) => {
+    return `${req.method} ${req.url} ${res.statusCode}`;
+  },
+  customErrorMessage: (req, res, err) => {
+    return `${req.method} ${req.url} ${res.statusCode} - ${err?.message}`;
+  },
+}));
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  const startTime = Date.now();
+  const tracer = trace.getTracer('agent-custom');
+  const span = tracer.startSpan('health-check');
+  
+  try {
+    span.setAttributes({
+      'service.name': 'agent_custom',
+      'endpoint': '/health',
+      'method': 'GET'
+    });
+
+    const healthData = {
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      service: 'agent_custom',
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      version: process.env['npm_package_version'] || '1.0.0',
+      circuitBreaker: {
+        state: circuitBreakerService.getState(),
+        failures: circuitBreakerService.getFailureCount(),
+        lastFailureTime: circuitBreakerService.getLastFailureTime()
+      }
+    };
+
+    const latency = Date.now() - startTime;
+    
+    logger.info({
+      request_id: req.id,
+      method: 'GET',
+      path: '/health',
+      status: 200,
+      latency_ms: latency
+    }, 'Health check completed');
+
+    span.setAttributes({
+      'http.status_code': 200,
+      'response.latency_ms': latency
+    });
+
+    res.status(200).json(healthData);
+  } catch (error) {
+    const latency = Date.now() - startTime;
+    
+    logger.error({
+      request_id: req.id,
+      method: 'GET',
+      path: '/health',
+      status: 500,
+      latency_ms: latency,
+      error: error instanceof Error ? error.message : 'Unknown error'
+    }, 'Health check failed');
+
+    span.recordException(error instanceof Error ? error : new Error('Unknown error'));
+    span.setAttributes({
+      'http.status_code': 500,
+      'response.latency_ms': latency
+    });
+
+    res.status(500).json({ 
+      status: 'unhealthy', 
+      error: 'Internal server error',
+      timestamp: new Date().toISOString()
+    });
+  } finally {
+    span.end();
+  }
+});
+
+// Run endpoint with outbound HTTP call
+app.post('/run', async (req, res) => {
+  const startTime = Date.now();
+  const requestId = req.id;
+  const tracer = trace.getTracer('agent-custom');
+  
+  const span = tracer.startSpan('run-endpoint', {
+    attributes: {
+      'service.name': 'agent_custom',
+      'endpoint': '/run',
+      'method': 'POST',
+      'request_id': String(requestId)
+    }
+  });
+
+  try {
+    logger.info({
+      request_id: requestId,
+      method: 'POST',
+      path: '/run',
+      body: req.body
+    }, 'Processing run request');
+
+    // Perform outbound HTTP call with retries and circuit breaker
+    const result = await context.with(trace.setSpan(context.active(), span), async () => {
+      return await gatewayService.makeOutboundCall(String(requestId));
+    });
+
+    const latency = Date.now() - startTime;
+    
+    logger.info({
+      request_id: requestId,
+      method: 'POST',
+      path: '/run',
+      status: 200,
+      latency_ms: latency,
+      gateway_response: result
+    }, 'Run request completed successfully');
+
+    span.setAttributes({
+      'http.status_code': 200,
+      'response.latency_ms': latency,
+      'gateway.response_status': result.status
+    });
+
+    res.status(200).json({
+      success: true,
+      request_id: requestId,
+      timestamp: new Date().toISOString(),
+      latency_ms: latency,
+      gateway_response: result
+    });
+
+  } catch (error) {
+    const latency = Date.now() - startTime;
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    
+    logger.error({
+      request_id: requestId,
+      method: 'POST',
+      path: '/run',
+      status: 500,
+      latency_ms: latency,
+      error: errorMessage,
+      circuit_breaker_state: circuitBreakerService.getState()
+    }, 'Run request failed');
+
+    span.recordException(error instanceof Error ? error : new Error(errorMessage));
+    span.setAttributes({
+      'http.status_code': 500,
+      'response.latency_ms': latency,
+      'error.message': errorMessage
+    });
+
+    res.status(500).json({
+      success: false,
+      request_id: requestId,
+      timestamp: new Date().toISOString(),
+      latency_ms: latency,
+      error: errorMessage,
+      circuit_breaker_state: circuitBreakerService.getState()
+    });
+  } finally {
+    span.end();
+  }
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  logger.warn({
+    request_id: req.id,
+    method: req.method,
+    path: req.originalUrl,
+    status: 404
+  }, 'Route not found');
+
+  res.status(404).json({ 
+    error: 'Route not found',
+    path: req.originalUrl,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Error handler
+app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  logger.error({
+    request_id: req.id,
+    method: req.method,
+    path: req.path,
+    status: 500,
+    error: err.message,
+    stack: err.stack
+  }, 'Unhandled error');
+
+  res.status(500).json({ 
+    error: 'Internal server error',
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.listen(PORT, () => {
+  logger.info({
+    port: PORT,
+    service: 'agent_custom',
+    environment: process.env['NODE_ENV'] || 'development',
+    gateway_url: process.env['GATEWAY_URL'] || 'not configured'
+  }, 'Agent Custom service started');
+});
+
+export default app;

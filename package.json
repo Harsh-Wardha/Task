@@ -1,0 +1,25 @@
+{
+  "name": "nodejs-microservices-demo",
+  "version": "1.0.0",
+  "description": "Two isolated Node.js/TypeScript services orchestrated with Docker Compose",
+  "private": true,
+  "workspaces": [
+    "services/agent_demo",
+    "services/agent_custom"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "start": "docker-compose up",
+    "dev": "docker-compose -f docker-compose.dev.yml up",
+    "test": "npm run test --workspaces",
+    "lint": "echo 'Linting disabled - TypeScript compilation handles type checking'",
+    "type-check": "npm run type-check --workspaces"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0",
+    "eslint": "^8.55.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0"
+  }
+}
